@@ -4,6 +4,7 @@ defmodule Moebius.Query do
   alias Moebius.QueryCommand
   alias Moebius.CommandBatch
   use Moebius.QueryFilter
+  require Logger
 
   @moduledoc """
   The main query interface for Moebius. Import this module into your code and query like a champ
@@ -267,6 +268,26 @@ defmodule Moebius.Query do
 
 
   @doc """
+  Insert multiple rows at once, within a single transaction, returning the inserted records. Pass in a composite list, containing the rows  to be inserted and an option  with the corresdponding constraint columns.
+  Note, the columns to be inserted are defined based on the first record in the list. All records to be inserted must adhere to the same schema.
+  """
+
+  def insert_bulk_data table_name, data, option, constraint_columns do
+    case data do
+      [] -> Logger.info "No data to insert into table #{table_name}"
+      _ -> try do
+             res = Moebius.Query.db(table_name)
+                   |> bulk_insert(data, option, constraint_columns)
+                   |> Moebius.Db.transact_batch
+             Logger.info "Table #{table_name}: #{inspect(res)}"
+           catch
+             _ -> Logger.error "Something went wrong while bulk inserting to table=#{table_name}"
+           end
+    end
+  end
+
+
+  @doc """
   Insert multiple rows at once, within a single transaction, returning the inserted records. Pass in a composite list, containing the rows  to be inserted.
   Note, the columns to be inserted are defined based on the first record in the list. All records to be inserted must adhere to the same schema.
 
@@ -291,6 +312,36 @@ defmodule Moebius.Query do
     |> bulk_insert_batch(list, [], column_map)
   end
 
+  def bulk_insert(%QueryCommand{} = cmd, list, option) when is_list(list) do
+    bulk_insert(cmd, list, option, nil)
+  end
+
+
+  def bulk_insert(%QueryCommand{} = cmd, list, option, constraint_columns) when is_list(list) do
+    column_map = list |> hd |> Keyword.keys
+    cmd
+    |> bulk_insert_batch(list, [], column_map, option, constraint_columns)
+  end
+
+
+  defp bulk_insert_batch(%QueryCommand{} = cmd, list, acc, column_map, option, constraint_columns) when is_list(list) do
+    # split the records into command batches that won't overwhelm postgres with params:
+    # 20,000 seems to be the optimal number here. Technically you can go up to 34,464, but I think Postgrex imposes a lower limit, as I
+    # hit a wall at 34,000, but succeeded at 30,000. Perf on 100k records is best at 20,000.
+
+    max_params = 50000
+    column_count = length(column_map)
+    max_records_per_command = div(max_params, column_count)
+
+    { current, next_batch } = Enum.split(list, max_records_per_command)
+    new_cmd = bulk_insert_command(cmd, current, column_map, option, constraint_columns)
+    case next_batch do
+      [] -> %CommandBatch{commands: Enum.reverse([new_cmd | acc])}
+      _ -> Moebius.Query.db(cmd.table_name) |> bulk_insert_batch(next_batch, [new_cmd | acc], column_map, option, constraint_columns)
+    end
+  end
+
+
   defp bulk_insert_batch(%QueryCommand{} = cmd, list, acc, column_map) when is_list(list) do
     # split the records into command batches that won't overwhelm postgres with params:
     # 20,000 seems to be the optimal number here. Technically you can go up to 34,464, but I think Postgrex imposes a lower limit, as I
@@ -307,6 +358,44 @@ defmodule Moebius.Query do
       _ -> db(cmd.table_name) |> bulk_insert_batch(next_batch, [new_cmd | acc], column_map)
     end
   end
+
+
+
+  defp bulk_insert_command(%QueryCommand{} = cmd, list, column_map, option, constraint_columns) when is_list(list) do
+    column_count = length(column_map)
+    row_count = length(list)
+
+    param_list = for row <- 0..row_count-1 do
+      list = (row * column_count + 1 .. (row * column_count) + column_count)
+             |> Enum.to_list
+             |> Enum.map_join(",", &"$#{&1}")
+      "(#{list})"
+    end
+
+    params = for row <- list, {_k, v} <- row, do: v
+    column_names = Enum.map_join(column_map,", ", &"#{&1}")
+    value_sql = Enum.join param_list, ","
+    opt = case option do
+      :nothing -> " ON CONFLICT DO NOTHING"
+      :update ->
+        case constraint_columns do
+          nil -> ""
+          _ -> constraints = constraint_columns |> Enum.map(&Atom.to_string(&1)) |> Enum.join(",")
+               update = "ON CONFLICT(#{constraints}) DO UPDATE SET "
+               columns = String.split(column_names, ",")
+               set_columns = columns
+                             |> Enum.map(fn(column) -> String.trim(column) <> "=EXCLUDED." <> String.trim(column) end)
+                             |> Enum.join(",")
+               update <> set_columns
+        end
+      _ -> ""
+
+    end
+    sql = "insert into #{cmd.table_name}(#{column_names}) values #{value_sql} " <> opt <> ";"
+    %{cmd | sql: sql, params: params, type: :insert}
+  end
+
+
 
   defp bulk_insert_command(%QueryCommand{} = cmd, list, column_map) when is_list(list) do
     column_count = length(column_map)
